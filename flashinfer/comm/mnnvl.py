@@ -18,6 +18,7 @@ import logging
 import os
 import socket
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 import sys
 from typing import Any, Dict, List, Optional, Sequence, TYPE_CHECKING
@@ -689,9 +690,19 @@ def make_handle_exchanger(
     comm: CommBackend, rank: int, size: int, dev_id: int
 ) -> HandleExchanger:
     """Pick FABRIC vs POSIX-fd handles based on the device's fabric support."""
-    if is_mnnvl_fabric_supported(dev_id):
+    with _collective_init_stage(comm):
+        fabric = is_mnnvl_fabric_supported(dev_id)
+        host = socket.gethostname().encode()
+    support = comm.allgather(int(fabric))
+    if any(support) and not all(support):
+        raise RuntimeError("Ranks disagree on FABRIC handle support")
+    if all(support):
         handle_type = cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
     else:
+        if len(set(comm.allgather(host))) != 1:
+            raise RuntimeError(
+                "POSIX handle exchange requires a node-local process group"
+            )
         handle_type = (
             cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
         )
@@ -735,8 +746,24 @@ def handle_close(ex: HandleExchanger | None) -> None:
 
 
 # TODO: This class follows similar logic with MnnvlMemory, but the latter use single instance mode to manage the memory allocation.
+@contextmanager
+def _collective_init_stage(comm: CommBackend):
+    """Agree on local initialization errors before entering the next collective."""
+    error = None
+    try:
+        yield
+    except Exception as exc:
+        error = exc
+    if not all(comm.allgather(int(error is None))):
+        raise RuntimeError(
+            "Symmetric memory initialization failed on a rank"
+        ) from error
+
+
 class SymmDeviceMemory:
     """Python port of SymmDeviceMemory from TensorRT-LLM"""
+
+    collective_init_supported = True
 
     def __init__(
         self,
@@ -748,24 +775,6 @@ class SymmDeviceMemory:
         enable_multicast: bool = True,
         allocate_signal_pads: bool = True,
     ):
-        cu_device = checkCudaErrors(cuda.cuDeviceGet(device_idx))
-
-        primary_ctx = checkCudaErrors(cuda.cuDevicePrimaryCtxRetain(cu_device))
-        checkCudaErrors(cuda.cuCtxSetCurrent(primary_ctx))
-
-        # Set CUDA device
-        # Check if cuda.cudart is available and import accordingly
-        from flashinfer.utils import has_cuda_cudart
-
-        if has_cuda_cudart():
-            # cuda-python <= 12.9
-            import cuda.cudart as cudart
-        else:
-            # cuda-python >= 13.0
-            import cuda.bindings.runtime as cudart
-
-        checkCudaErrors(cudart.cudaSetDevice(device_idx))
-
         self.device_idx = device_idx
         self.group_size = group_size
         self.group_rank = group_rank
@@ -777,6 +786,8 @@ class SymmDeviceMemory:
 
         # CUDA memory handles and pointers
         self.mc_ptr = 0  # CUdeviceptr mMcPtr
+        self._mc_mapped = False
+        self._closed = False
         self.uc_ptrs: List[int] = []  # std::vector<CUdeviceptr> mUcPtrs
         self.signal_pads: List[int] = []  # mSignalPads
         self.signal_pads_dev = 0  # std::vector<CUdeviceptr> mSignalPadsDev
@@ -791,39 +802,72 @@ class SymmDeviceMemory:
         self.SIGNAL_PAD_ALIGNMENT = 16
         self.SIGNAL_PAD_SIZE = SIGNAL_PAD_SIZE
 
-        # Check if device supports multicasting
-        if self._enable_multicast and not is_multicast_supported(device_idx):
-            raise RuntimeError(
-                "[SymmDeviceMemory] Device does not support multicasting."
-            )
-
-        # Calculate signal pad offset with alignment (matching C++ exactly)
-        self.signal_pad_offset = round_up(buf_size, self.SIGNAL_PAD_ALIGNMENT)
-
-        logging.info(
-            f"[SymmDeviceMemory] Rank: {group_rank}, Group size: {group_size}, "
-            f"device_idx: {device_idx}, "
-            f"Signal pad offset: {self.signal_pad_offset}"
-        )
-
         self._exchanger: Optional[HandleExchanger] = None
-        self._create_and_map_handles(self.comm_backend)
+        try:
+            with _collective_init_stage(self.comm_backend):
+                cu_device = checkCudaErrors(cuda.cuDeviceGet(device_idx))
 
-        if allocate_signal_pads:
-            # Initialize signal pads
-            self.signal_pads = [0] * self.group_size
-            for i in range(self.group_size):
-                self.signal_pads[i] = self.uc_ptrs[i] + self.signal_pad_offset
-                if i == self.group_rank:
-                    checkCudaErrors(
-                        cuda.cuMemsetD8(self.signal_pads[i], 0, self.SIGNAL_PAD_SIZE)
+                primary_ctx = checkCudaErrors(cuda.cuDevicePrimaryCtxRetain(cu_device))
+                checkCudaErrors(cuda.cuCtxSetCurrent(primary_ctx))
+
+                # Set CUDA device
+                # Check if cuda.cudart is available and import accordingly
+                from flashinfer.utils import has_cuda_cudart
+
+                if has_cuda_cudart():
+                    # cuda-python <= 12.9
+                    import cuda.cudart as cudart
+                else:
+                    # cuda-python >= 13.0
+                    import cuda.bindings.runtime as cudart
+
+                checkCudaErrors(cudart.cudaSetDevice(device_idx))
+
+                # Check if device supports multicasting
+                if self._enable_multicast and not is_multicast_supported(device_idx):
+                    raise RuntimeError(
+                        "[SymmDeviceMemory] Device does not support multicasting."
                     )
 
-            self.signal_pads_dev = alloc_and_copy_to_cuda(self.signal_pads)
-        self.uc_ptrs_dev = alloc_and_copy_to_cuda(self.uc_ptrs)
+                # Calculate signal pad offset with alignment (matching C++ exactly)
+                self.signal_pad_offset = round_up(buf_size, self.SIGNAL_PAD_ALIGNMENT)
+
+                logging.info(
+                    f"[SymmDeviceMemory] Rank: {group_rank}, Group size: {group_size}, "
+                    f"device_idx: {device_idx}, "
+                    f"Signal pad offset: {self.signal_pad_offset}"
+                )
+
+            self._create_and_map_handles(self.comm_backend)
+
+            with _collective_init_stage(self.comm_backend):
+                if allocate_signal_pads:
+                    # Initialize signal pads
+                    self.signal_pads = [0] * self.group_size
+                    for i in range(self.group_size):
+                        self.signal_pads[i] = self.uc_ptrs[i] + self.signal_pad_offset
+                        if i == self.group_rank:
+                            checkCudaErrors(
+                                cuda.cuMemsetD8(
+                                    self.signal_pads[i], 0, self.SIGNAL_PAD_SIZE
+                                )
+                            )
+
+                    self.signal_pads_dev = alloc_and_copy_to_cuda(self.signal_pads)
+                self.uc_ptrs_dev = alloc_and_copy_to_cuda(self.uc_ptrs)
+
+        except Exception:
+            self._release()
+            raise
 
     def __del__(self):
-        """Destructor - cleanup allocated memory"""
+        self._release()
+
+    def _release(self):
+        """Release owned resources, including a partially initialized allocation."""
+        if getattr(self, "_closed", True):
+            return
+        self._closed = True
 
         if hasattr(self, "_exchanger") and self._exchanger is not None:
             handle_close(self._exchanger)
@@ -873,18 +917,22 @@ class SymmDeviceMemory:
                     cuda.cuMemAddressFree(self.uc_base_ptr, self.total_uc_size)
                 )
 
-        # Release MC handle
-        if hasattr(self, "mc_handle") and self.mc_handle and self.mc_handle != 0:
-            try:
+        # Failed initialization may own an MC handle without a mapped pointer.
+        try:
+            if self._mc_mapped:
                 checkCudaErrors(cuda.cuMemUnmap(self.mc_ptr, self.allocation_size))
+            if self.mc_ptr:
                 checkCudaErrors(
                     cuda.cuMemAddressFree(self.mc_ptr, self.allocation_size)
                 )
-                checkCudaErrors(cuda.cuMemRelease(self.mc_handle))
-            except Exception as e:
-                logger.warning("Destructor: Failed to release MC handle: %s", e)
-        elif hasattr(self, "mc_ptr") and self.mc_ptr:
-            checkCudaErrors(cuda.cuMemAddressFree(self.mc_ptr, self.allocation_size))
+        except Exception as error:
+            logger.warning("Destructor: Failed to unmap MC memory: %s", error)
+        finally:
+            if self.mc_handle:
+                try:
+                    checkCudaErrors(cuda.cuMemRelease(self.mc_handle))
+                except Exception as error:
+                    logger.warning("Destructor: Failed to release MC handle: %s", error)
 
     def get_signal_pad_ptrs_host(self) -> List[int]:
         """Get the raw array of signal pad pointers to all ranks (including self)"""
@@ -940,15 +988,17 @@ class SymmDeviceMemory:
 
     def _create_and_map_handles(self, comm: CommBackend) -> None:
         """Create physical backing and map it at the reserved addresses."""
+        self.comm_backend = comm
         # Create handle exchanger
         self._exchanger = make_handle_exchanger(
             comm, self.group_rank, self.group_size, self.device_idx
         )
 
-        self._verify_cuda_context()
+        with _collective_init_stage(comm):
+            self._verify_cuda_context()
 
-        # Compute allocation size and get allocation properties
-        allocation_prop, mc_prop = self._get_allocation_prop(self.buf_size)
+            # Compute allocation size and get allocation properties
+            allocation_prop, mc_prop = self._get_allocation_prop(self.buf_size)
 
         # Allocate, exchange, and map unicast buffers
         self._allocate_unicast_buffers(allocation_prop)
@@ -973,6 +1023,7 @@ class SymmDeviceMemory:
                 )
             )
             checkCudaErrors(cuda.cuMemUnmap(self.mc_ptr, self.allocation_size))
+            self._mc_mapped = False
 
         for ptr in self.uc_ptrs:
             checkCudaErrors(cuda.cuMemUnmap(ptr, self.allocation_size))
@@ -1050,19 +1101,26 @@ class SymmDeviceMemory:
         # Initialize UC handles list
         self.uc_handles = [0] * self.group_size
 
-        # Allocate local GPU memory
-        self.uc_handles[self.group_rank] = checkCudaErrors(
-            cuda.cuMemCreate(self.allocation_size, allocation_prop, 0)
-        )
+        local_shareable_uc_handle = None
+        try:
+            with _collective_init_stage(self.comm_backend):
+                # Allocate local GPU memory
+                self.uc_handles[self.group_rank] = checkCudaErrors(
+                    cuda.cuMemCreate(self.allocation_size, allocation_prop, 0)
+                )
 
-        # Export local handle to shareable handle
-        local_shareable_uc_handle = checkCudaErrors(
-            cuda.cuMemExportToShareableHandle(
-                self.uc_handles[self.group_rank],
-                self._exchanger.handle_type,
-                0,
-            )
-        )
+                # Export local handle to shareable handle
+                local_shareable_uc_handle = checkCudaErrors(
+                    cuda.cuMemExportToShareableHandle(
+                        self.uc_handles[self.group_rank],
+                        self._exchanger.handle_type,
+                        0,
+                    )
+                )
+
+        except Exception:
+            handle_cleanup(self._exchanger, local_shareable_uc_handle)
+            raise
 
         # All-gather shareable handles. For POSIX fds, entry[group_rank] is our
         # own local_shareable_uc_handle (not a dup), so the cleanup loop below
@@ -1070,106 +1128,133 @@ class SymmDeviceMemory:
         all_shareable_uc_handles = handle_allgather(
             self._exchanger, local_shareable_uc_handle
         )
-        cuda.cuCtxSynchronize()
+        with _collective_init_stage(self.comm_backend):
+            try:
+                cuda.cuCtxSynchronize()
 
-        # Import remote handles
-        for p in range(self.group_size):
-            if p != self.group_rank:
-                self.uc_handles[p] = checkCudaErrors(
-                    cuda.cuMemImportFromShareableHandle(
-                        all_shareable_uc_handles[p],
-                        self._exchanger.handle_type,
+                # Import remote handles
+                for p in range(self.group_size):
+                    if p != self.group_rank:
+                        self.uc_handles[p] = checkCudaErrors(
+                            cuda.cuMemImportFromShareableHandle(
+                                all_shareable_uc_handles[p],
+                                self._exchanger.handle_type,
+                            )
+                        )
+
+                # Reserve address space for UC pointers
+                if not self.uc_ptrs:
+                    self.uc_ptrs = [0] * self.group_size
+                    total_uc_size = self.allocation_size * self.group_size
+                    self.total_uc_size = total_uc_size
+                    uc_base_ptr = checkCudaErrors(
+                        cuda.cuMemAddressReserve(
+                            total_uc_size, self._mc_granularity, 0, 0
+                        )
+                    )
+                    self.uc_base_ptr = uc_base_ptr
+                    for i in range(self.group_size):
+                        offset = self.allocation_size * i
+                        self.uc_ptrs[i] = int(uc_base_ptr) + offset
+
+                # Map UC memory
+                for i in range(self.group_size):
+                    checkCudaErrors(
+                        cuda.cuMemMap(
+                            self.uc_ptrs[i],
+                            self.allocation_size,
+                            0,
+                            self.uc_handles[i],
+                            0,
+                        )
+                    )
+
+                # Set memory access permissions for UC
+                access_desc = self._get_mem_access_desc()
+                checkCudaErrors(
+                    cuda.cuMemSetAccess(
+                        self.uc_base_ptr, self.total_uc_size, [access_desc], 1
                     )
                 )
-            handle_cleanup(self._exchanger, all_shareable_uc_handles[p])
 
-        # Reserve address space for UC pointers
-        if not self.uc_ptrs:
-            self.uc_ptrs = [0] * self.group_size
-            total_uc_size = self.allocation_size * self.group_size
-            self.total_uc_size = total_uc_size
-            uc_base_ptr = checkCudaErrors(
-                cuda.cuMemAddressReserve(total_uc_size, self._mc_granularity, 0, 0)
-            )
-            self.uc_base_ptr = uc_base_ptr
-            for i in range(self.group_size):
-                offset = self.allocation_size * i
-                self.uc_ptrs[i] = int(uc_base_ptr) + offset
-
-        # Map UC memory
-        for i in range(self.group_size):
-            checkCudaErrors(
-                cuda.cuMemMap(
-                    self.uc_ptrs[i], self.allocation_size, 0, self.uc_handles[i], 0
-                )
-            )
-
-        # Set memory access permissions for UC
-        access_desc = self._get_mem_access_desc()
-        checkCudaErrors(
-            cuda.cuMemSetAccess(self.uc_base_ptr, self.total_uc_size, [access_desc], 1)
-        )
+            finally:
+                for handle in all_shareable_uc_handles:
+                    handle_cleanup(self._exchanger, handle)
 
     def _setup_multicast(self, mc_prop):
         """Create multicast object, exchange handle, map memory, and bind."""
-        # Rank 0 creates the multicast object
-        if self.group_rank == 0:
-            self.mc_handle = checkCudaErrors(cuda.cuMulticastCreate(mc_prop))
-            shareable_mc_handle = checkCudaErrors(
-                cuda.cuMemExportToShareableHandle(
-                    self.mc_handle,
-                    self._exchanger.handle_type,
-                    0,
-                )
-            )
-        else:
-            shareable_mc_handle = None
+        shareable_mc_handle = None
+        try:
+            with _collective_init_stage(self.comm_backend):
+                # Rank 0 creates the multicast object
+                if self.group_rank == 0:
+                    self.mc_handle = checkCudaErrors(cuda.cuMulticastCreate(mc_prop))
+                    shareable_mc_handle = checkCudaErrors(
+                        cuda.cuMemExportToShareableHandle(
+                            self.mc_handle,
+                            self._exchanger.handle_type,
+                            0,
+                        )
+                    )
+                else:
+                    shareable_mc_handle = None
+
+        except Exception:
+            handle_cleanup(self._exchanger, shareable_mc_handle)
+            raise
 
         # Broadcast multicast handle from rank 0
         shareable_mc_handle = handle_broadcast(
             self._exchanger, shareable_mc_handle, root=0
         )
-        cuda.cuCtxSynchronize()
+        with _collective_init_stage(self.comm_backend):
+            try:
+                cuda.cuCtxSynchronize()
 
-        # Import multicast handle for non-root ranks
-        if self.group_rank != 0:
-            self.mc_handle = checkCudaErrors(
-                cuda.cuMemImportFromShareableHandle(
-                    shareable_mc_handle,
-                    self._exchanger.handle_type,
+                # Import multicast handle for non-root ranks
+                if self.group_rank != 0:
+                    self.mc_handle = checkCudaErrors(
+                        cuda.cuMemImportFromShareableHandle(
+                            shareable_mc_handle,
+                            self._exchanger.handle_type,
+                        )
+                    )
+
+            finally:
+                handle_cleanup(self._exchanger, shareable_mc_handle)
+
+        with _collective_init_stage(self.comm_backend):
+            # Add device to multicast
+            checkCudaErrors(cuda.cuMulticastAddDevice(self.mc_handle, self.device_idx))
+
+        with _collective_init_stage(self.comm_backend):
+            # Reserve and map MC pointer
+            if not self.mc_ptr:
+                self.mc_ptr = checkCudaErrors(
+                    cuda.cuMemAddressReserve(
+                        self.allocation_size, self._mc_granularity, 0, 0
+                    )
+                )
+            checkCudaErrors(
+                cuda.cuMemMap(self.mc_ptr, self.allocation_size, 0, self.mc_handle, 0)
+            )
+            self._mc_mapped = True
+            access_desc = self._get_mem_access_desc()
+            checkCudaErrors(
+                cuda.cuMemSetAccess(self.mc_ptr, self.allocation_size, [access_desc], 1)
+            )
+
+            # Bind local memory to multicast
+            checkCudaErrors(
+                cuda.cuMulticastBindMem(
+                    self.mc_handle,
+                    0,  # mcOffset
+                    self.uc_handles[self.group_rank],
+                    0,  # memOffset
+                    self.allocation_size,
+                    0,  # flags
                 )
             )
-        handle_cleanup(self._exchanger, shareable_mc_handle)
-
-        # Add device to multicast
-        checkCudaErrors(cuda.cuMulticastAddDevice(self.mc_handle, self.device_idx))
-
-        # Reserve and map MC pointer
-        if not self.mc_ptr:
-            self.mc_ptr = checkCudaErrors(
-                cuda.cuMemAddressReserve(
-                    self.allocation_size, self._mc_granularity, 0, 0
-                )
-            )
-        checkCudaErrors(
-            cuda.cuMemMap(self.mc_ptr, self.allocation_size, 0, self.mc_handle, 0)
-        )
-        access_desc = self._get_mem_access_desc()
-        checkCudaErrors(
-            cuda.cuMemSetAccess(self.mc_ptr, self.allocation_size, [access_desc], 1)
-        )
-
-        # Bind local memory to multicast
-        checkCudaErrors(
-            cuda.cuMulticastBindMem(
-                self.mc_handle,
-                0,  # mcOffset
-                self.uc_handles[self.group_rank],
-                0,  # memOffset
-                self.allocation_size,
-                0,  # flags
-            )
-        )
 
     def _get_mem_access_desc(self):
         """Create memory access descriptor for this device."""

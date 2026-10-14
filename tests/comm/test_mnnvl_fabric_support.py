@@ -52,3 +52,47 @@ def test_is_mnnvl_fabric_supported(fabric_uuid, state, supported, expected):
         else:
             init.assert_not_called()
             shutdown.assert_not_called()
+
+
+@pytest.mark.parametrize("local_error,peer_ready", [(False, 1), (True, 1), (False, 0)])
+def test_initialization_errors_are_agreed_before_next_collective(
+    local_error, peer_ready
+):
+    from unittest.mock import Mock
+
+    comm = Mock(allgather=lambda ready: [ready, peer_ready])
+    if local_error or not peer_ready:
+        with (
+            pytest.raises(RuntimeError, match="initialization failed"),
+            mnnvl._collective_init_stage(comm),
+        ):
+            if local_error:
+                raise ValueError("local allocation failed")
+    else:
+        with mnnvl._collective_init_stage(comm):
+            pass
+
+
+@pytest.mark.parametrize("local_fabric,peer_fabric", [(True, False), (False, True)])
+def test_handle_exchange_rejects_inconsistent_fabric_support(local_fabric, peer_fabric):
+    from unittest.mock import Mock
+
+    comm = Mock(
+        allgather=Mock(side_effect=[[1, 1], [int(local_fabric), int(peer_fabric)]])
+    )
+    with (
+        patch.object(mnnvl, "is_mnnvl_fabric_supported", return_value=local_fabric),
+        pytest.raises(RuntimeError, match="disagree"),
+    ):
+        mnnvl.make_handle_exchanger(comm, 0, 2, 0)
+
+
+def test_posix_handles_reject_cross_node_groups_before_exchange():
+    from unittest.mock import Mock
+
+    comm = Mock(allgather=Mock(side_effect=[[1, 1], [0, 0], [b"node0", b"node1"]]))
+    with (
+        patch.object(mnnvl, "is_mnnvl_fabric_supported", return_value=False),
+        pytest.raises(RuntimeError, match="node-local"),
+    ):
+        mnnvl.make_handle_exchanger(comm, 0, 2, 0)

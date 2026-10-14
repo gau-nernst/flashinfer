@@ -503,12 +503,15 @@ def create_allreduce_fusion_workspace(
         )
 
     elif actual_backend == "mnnvl":
-        if is_confidential_compute():
-            raise ValueError(
-                "NVIDIA Confidential Computing is not supported by the mnnvl AllReduce fusion backend "
-                "since mnnvl backend requires NVLink multicast, which is unavailable under Confidential Computing. "
-                "Use backend='trtllm' instead."
-            )
+        from .mnnvl import _collective_init_stage, MPIBackend
+
+        with _collective_init_stage(comm_backend or MPIBackend()):
+            if is_confidential_compute():
+                raise ValueError(
+                    "NVIDIA Confidential Computing is not supported by the mnnvl AllReduce fusion backend "
+                    "since mnnvl backend requires NVLink multicast, which is unavailable under Confidential Computing. "
+                    "Use backend='trtllm' instead."
+                )
         mapping = Mapping(
             world_size=world_size,
             rank=rank,

@@ -1053,3 +1053,95 @@ def test_mnnvl_allreduce_sentinel_patterns(
         legacy_api=False,
         inject_sentinel_patterns=True,
     )
+
+
+def test_mnnvl_oneshot_rmsnorm_uses_fp32_second_moment():
+    """BF16 products must not round before accumulating the RMSNorm moment."""
+    init_torch_distributed_from_mpi()
+    world = dist.get_world_size()
+    if world < 2:
+        pytest.skip("Requires at least two ranks")
+    rank = dist.get_rank()
+    torch.cuda.set_device(rank % torch.cuda.device_count())
+    group = dist.new_group(backend="gloo")
+    values = (torch.rand(32, generator=torch.Generator().manual_seed(2)) + 0.1).to(
+        torch.bfloat16
+    )
+    values = values.repeat(128).unsqueeze(0).cuda()
+    x = values.clone() if rank == 0 else torch.zeros_like(values)
+    residual = torch.zeros_like(x)
+    gamma = torch.ones(4096, dtype=x.dtype, device=x.device)
+    expected = (
+        values.float()
+        * torch.rsqrt(values.float().square().mean(-1, keepdim=True) + 1e-6)
+    ).to(x.dtype)
+    workspace = comm.create_allreduce_fusion_workspace(
+        backend="mnnvl",
+        world_size=world,
+        rank=rank,
+        max_token_num=1,
+        hidden_dim=4096,
+        dtype=x.dtype,
+        comm_backend=TorchDistBackend(group),
+        group=group,
+    )
+    try:
+        output = torch.empty_like(x)
+        comm.allreduce_fusion(
+            x,
+            workspace,
+            comm.AllReduceFusionPattern.kARResidualRMSNorm,
+            norm_out=output,
+            residual_out=torch.empty_like(x),
+            residual_in=residual,
+            rms_gamma=gamma,
+            rms_eps=1e-6,
+            use_oneshot=True,
+        )
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    finally:
+        workspace.destroy()
+        dist.destroy_process_group(group)
+
+
+@pytest.mark.parametrize(
+    "operation",
+    ["cuMemCreate", "cuMemMap", "cuMulticastCreate", "cuMulticastAddDevice"],
+)
+def test_mnnvl_rank_local_initialization_failure(monkeypatch, operation):
+    """A local failure must raise on every rank before the next collective."""
+    from unittest.mock import Mock
+    from flashinfer.comm import mnnvl
+
+    init_torch_distributed_from_mpi()
+    world = dist.get_world_size()
+    if world < 2:
+        pytest.skip("Requires at least two ranks")
+    rank = dist.get_rank()
+    torch.cuda.set_device(rank % torch.cuda.device_count())
+    group = dist.new_group(backend="gloo")
+    backend = TorchDistBackend(group)
+    try:
+        if not all(
+            backend.allgather(mnnvl.is_multicast_supported(torch.cuda.current_device()))
+        ):
+            pytest.skip("Requires multicast support on every rank")
+        fail = Mock(return_value=(mnnvl.cuda.CUresult.CUDA_ERROR_OUT_OF_MEMORY, 0))
+        if rank == 0:
+            monkeypatch.setattr(mnnvl.cuda, operation, fail)
+        with pytest.raises(RuntimeError, match="initialization failed"):
+            comm.create_allreduce_fusion_workspace(
+                backend="mnnvl",
+                world_size=world,
+                rank=rank,
+                max_token_num=16,
+                hidden_dim=4096,
+                dtype=torch.bfloat16,
+                comm_backend=backend,
+                group=group,
+            )
+        if rank == 0:
+            fail.assert_called()
+        backend.barrier()
+    finally:
+        dist.destroy_process_group(group)

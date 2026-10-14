@@ -1006,8 +1006,8 @@ __global__ void __launch_bounds__(1024)
     float threadSum = 0.F;
 #pragma unroll
     for (int i = 0; i < kELTS_PER_THREAD; i++) {
-      // FIXME: Use float square if accuracy issue
-      threadSum += toFloat<T>(packedAccum.elements[i] * packedAccum.elements[i]);
+      float const value = toFloat<T>(packedAccum.elements[i]);
+      threadSum += value * value;
     }
     float blockSum = blockReduceSum<float, true>(threadSum);
 

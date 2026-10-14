@@ -19,7 +19,13 @@ from flashinfer.api_logging import flashinfer_api
 from ..jit import gen_trtllm_mnnvl_comm_module
 from ..utils import register_custom_op, round_up
 from ..fp4_quantization import _compute_swizzled_layout_sf_size
-from .mnnvl import CommBackend, McastGPUBuffer, MPIBackend, SymmDeviceMemory
+from .mnnvl import (
+    CommBackend,
+    McastGPUBuffer,
+    MPIBackend,
+    SymmDeviceMemory,
+    _collective_init_stage,
+)
 from .trtllm_ar import QuantizationSFLayout
 from .workspace_base import AllReduceFusionWorkspace
 
@@ -174,31 +180,36 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             f"[MNNVL Allreduce] Actual allocated size: {allocated_size} bytes, Actual buffer size per lamport buffer: {self.buffer_size_bytes} bytes, total workspace: {self.workspace_size_bytes} bytes."
         )
 
-        self.handle.lamport_initialize(self.rank, torch.float32)
-        torch.cuda.synchronize()
-        comm_backend.barrier()
+        try:
+            with _collective_init_stage(comm_backend):
+                self.handle.lamport_initialize(self.rank, torch.float32)
+                torch.cuda.synchronize()
 
-        # This is a buffer to maintain the state of this allreduce Op
-        # Should have the same lifetime with self._buffer
-        # The flag should be binded to each buffer allocation
-        # Layout: [cur idx, dirty idx, bytes per buffer, dirty num stages, numBytesToClear[4], access count ptr]
-        num_bytes_to_clear = [0] * 4
-        self.buffer_flags = torch.tensor(
-            [0, 2, self.buffer_size_bytes, 0, *num_bytes_to_clear, 0],
-            dtype=torch.uint32,
-            device=torch.device("cuda", torch.cuda.current_device()),
-        )
+                # This is a buffer to maintain the state of this allreduce Op
+                # Should have the same lifetime with self._buffer
+                # The flag should be binded to each buffer allocation
+                # Layout: [cur idx, dirty idx, bytes per buffer, dirty num stages, numBytesToClear[4], access count ptr]
+                num_bytes_to_clear = [0] * 4
+                self.buffer_flags = torch.tensor(
+                    [0, 2, self.buffer_size_bytes, 0, *num_bytes_to_clear, 0],
+                    dtype=torch.uint32,
+                    device=torch.device("cuda", torch.cuda.current_device()),
+                )
 
-        self.uc_ptrs_dev = self.handle.get_buffer_ptrs_dev()
-        self.uc_ptr_local = self.handle.get_unicast_ptr(self.rank)
-        self.mc_ptr = self.handle.get_multicast_ptr()
-        if not self.mc_ptr:
+                self.uc_ptrs_dev = self.handle.get_buffer_ptrs_dev()
+                self.uc_ptr_local = self.handle.get_unicast_ptr(self.rank)
+                self.mc_ptr = self.handle.get_multicast_ptr()
+                if not self.mc_ptr:
+                    raise RuntimeError(
+                        "[MNNVLAllReduceFusionWorkspace] Multicast pointer is null after rendezvous. "
+                        "This requires NVLink multicast (SM90+ with NVLink, e.g. H100 SXM). "
+                        "Use backend='trtllm' or backend='auto' on unsupported hardware."
+                    )
+
+        except Exception:
+            self.handle.mcast_device_memory._release()
             self.destroy()
-            raise RuntimeError(
-                "[MNNVLAllReduceFusionWorkspace] Multicast pointer is null after rendezvous. "
-                "This requires NVLink multicast (SM90+ with NVLink, e.g. H100 SXM). "
-                "Use backend='trtllm' or backend='auto' on unsupported hardware."
-            )
+            raise
 
     @functools.cache
     def is_buffer_size_sufficient(
@@ -307,20 +318,24 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         if memory.mapped:
             return
         memory._create_and_map_handles(comm_backend)
-        self._initialize_protocol()
-        comm_backend.barrier()
+        with _collective_init_stage(comm_backend):
+            self._initialize_protocol()
 
     def destroy(self) -> None:
         """Destroy workspace and free resources."""
         if getattr(self, "_destroyed", False):
             return  # Already destroyed, nothing to do
 
-        del self.buffer_flags
-        del self.uc_ptrs_dev
-        del self.uc_ptr_local
-        del self.mc_ptr
-        del self.handle
-        del self.ptrs
+        for name in (
+            "buffer_flags",
+            "uc_ptrs_dev",
+            "uc_ptr_local",
+            "mc_ptr",
+            "handle",
+            "ptrs",
+        ):
+            if hasattr(self, name):
+                delattr(self, name)
         self._destroyed = True
 
 
